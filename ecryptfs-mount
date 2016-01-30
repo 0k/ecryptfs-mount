@@ -1,0 +1,135 @@
+#!/bin/bash
+
+exname=$(basename "$0")
+usage="$exanme MOUNTPATH KEY"
+
+## default mount options
+
+ecryptfs_enable_filename_crypto=${ecryptfs_enable_filename_crypto:-y}
+ecryptfs_passthrough=${ecryptfs_passthrough:-n}
+ecryptfs_key_bytes=${ecryptfs_key_bytes:-16}
+ecryptfs_cipher=${ecryptfs_cipher:-aes}
+
+## lists all mount opts
+mount_opts="
+  ecryptfs_enable_filename_crypto ecryptfs_passthrough
+  ecryptfs_key_bytes ecryptfs_cipher"
+
+
+##
+## functions
+##
+
+warn() { echo "Warning:" "$@" >&2 ; }
+info() { echo "Info:" "$@" >&2 ; }
+verb() { [ -z "$VERBOSE" ] || echo "$@" >&2 ; }
+err() { echo "Error:" "$@" >&2 ; }
+die() { err "$@" ; exit 1; }
+
+verify_dependencies() {
+   local missing=()
+   for cmd in "$@"; do
+       type -t "$cmd" >/dev/null || missing+=("$cmd")
+   done
+   test "${#missing[@]}" == "0" && return 0
+   err "missing dependencie: ${missing[*]}"
+   return 1
+}
+
+
+## Efficient password generation utility all in bash builtin
+gen_password() {
+    local l=( {a..z} {A..Z} {0..9} ) nl="${#l[@]}" size=${1:-16}
+    while ((size--)); do echo -n "${l[$((RANDOM * nl / 32768))]}"; done
+}
+
+## appends a command to the signal handler functions
+#
+# example: trap_add EXIT,INT close_ssh "$ip"
+trap_add() {
+    local sigs="$1" sig cmd old_cmd
+    shift || {
+        echo "${FUNCNAME} usage error" >&2
+        return 1
+    }
+    cmd="$@"
+    while IFS="," read -d "," sig; do
+        prev_cmd="$(trap -p "$sig")"
+        if [ "$prev_cmd" ]; then
+            new_cmd="${prev_cmd#trap -- \'}"
+            new_cmd="${new_cmd%\' "$sig"};$cmd"
+        else
+            new_cmd="$cmd"
+        fi
+        trap -- "$new_cmd" "$sig" || {
+            echo "unable to add command '$@' to trap $sig" >&2 ;
+            return 1
+        }
+    done < <(echo "$sigs,")
+}
+
+
+##
+## Argument parsing
+##
+
+MOUNTPATH=$1
+KEY=$2
+if [ -z "$MOUNTPATH" ]; then
+    die "Please provide a MOUNTPATH to mount with encrypt as first argument."
+fi
+
+if ! [ -d "$MOUNTPATH" ]; then
+    die "Directory '$MOUNTPATH' not found. Please provide a valid MOUNTPATH as first argument."
+fi
+
+MOUNTPATH=$(readlink -e "$MOUNTPATH") || exit 1
+
+if [ -z "$KEY" ]; then
+    die "Please provide a KEY to mount $MOUNTPATH as second argument."
+fi
+
+if [ "${#KEY}" -gt "64" ]; then
+    die "Given key is too big (${#myvar} bytes). Maximum valid size for KEY is 64 bytes."
+fi
+
+if ! verify_dependencies ecryptfs-wrap-passphrase ecryptfs-insert-wrapped-passphrase-into-keyring; then
+    die "Missing required dependencies. You should probably install package \`ecryptfs-utils\`."
+fi
+
+##
+## code
+##
+
+verb "Generating salt key, for good measure"
+salt=$(gen_password 16)
+
+verb "Create temporary directory"
+tmpdir=$(mktemp -d -t tmp.XXXXXXXXXX)
+trap_add EXIT "rm -rf $tmpdir"
+
+verb "Create wrapped-passphrase file in temporary directory"
+tmp_wpp="$tmpdir/wrapped-passphrase"
+echo -en "$KEY\n$salt" | ecryptfs-wrap-passphrase "$tmp_wpp" >/dev/null
+
+verb "Insert passphrase into keyring"
+SIG=$(
+    echo -n "$salt" |
+        ecryptfs-insert-wrapped-passphrase-into-keyring "$tmp_wpp" |
+        tail -n 1 | sed -r 's/^.*\[([a-f0-9]+)\].*$/\1/g') || exit 1
+verb "  ..received sig=$SIG"
+
+
+verb "Making mount options"
+mount_command_options="ecryptfs_sig=$SIG,ecryptfs_fnek_sig=$SIG,ecryptfs_unlink_sigs=y"
+for opt in $mount_opts; do
+    mount_command_options="$mount_command_options,$opt=${!opt}"
+done
+
+verb "  ..Command:"
+verb ""
+verb "    mount -i" -t ecryptfs "$MOUNTPATH" "$MOUNTPATH" -o "$mount_command_options"
+verb ""
+mount -i -t ecryptfs "$MOUNTPATH" "$MOUNTPATH" -o "$mount_command_options"
+
+
